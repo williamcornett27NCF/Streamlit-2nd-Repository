@@ -1,0 +1,170 @@
+## Lighweight Testing Outline (Phase 1)
+
+# tests/test_processing.py
+
+import pytest
+
+from processing import extract_job_details, hash_description
+from models import JobListing
+
+
+def test_hash_description_deterministic():
+    text = "Lead Data Scientist\nLocation: Remote"
+    h1 = hash_description(text)
+    h2 = hash_description(text)
+    assert h1 == h2
+    assert len(h1) == 64  # SHA-256 hex
+
+
+def test_extract_job_details_regex_layer():
+    raw = """
+    Job Title: Senior Data Scientist
+    Company: ExampleCorp
+    Location: Remote
+    Apply here: https://jobs.example.com/apply/123
+    """
+    job: JobListing = extract_job_details(raw)
+    assert job.job_title == "Senior Data Scientist"
+    assert job.company == "ExampleCorp"
+    assert "Senior Data Scientist" in job.description
+
+## Update db_utils.py – Add “fetch recent jobs” Helper (Phase 1)
+
+from typing import List, Dict
+
+# Then append this new function to the bottom of db_utils.py:
+
+def fetch_recent_job_listings(limit: int = 10) -> List[Dict]:
+    """
+    Returns a list of recent job listings (as dictionaries) ordered by created_at DESC.
+    Only returns lightweight fields suitable for display in the UI.
+    """
+    conn = _get_db_connection()
+    if not conn:
+        return []
+
+    try:
+        with conn.cursor() as cur:
+            sql = """
+                SELECT
+                    job_title,
+                    company,
+                    location,
+                    apply_url,
+                    created_at
+                FROM job_listings
+                ORDER BY created_at DESC
+                LIMIT %s;
+            """
+            cur.execute(sql, (limit,))
+            rows = cur.fetchall()
+            columns = [desc[0] for desc in cur.description]
+            return [dict(zip(columns, row)) for row in rows]
+    finally:
+        conn.close()
+
+## Update app.py – Debug Preview + Recent Jobs Table (Phase 1) ((IMPORTS)
+
+from dataclasses import asdict
+
+import streamlit as st
+
+from models import JobListing
+from processing import extract_job_details, hash_description
+import db_utils
+
+## Debug / Preview Section for Extracted Job
+
+# Right after you retrieve job_obj and before the form, add an expander that shows the raw JobListing as JSON:
+
+job_obj = st.session_state.processed_job
+
+if job_obj is not None:
+    st.header("Step 2: Verify Extracted Information")
+    st.warning("Please review and correct any extracted details below before saving.")
+
+    # --- DEBUG / PREVIEW: show raw extracted object ---
+    with st.expander("Debug: View raw extracted JobListing object"):
+        st.json(asdict(job_obj))
+
+    with st.form(key="confirmation_form"):
+        edited_title = st.text_input(
+            "Job Title",
+            value=job_obj.job_title or "",
+        )
+        edited_company = st.text_input(
+            "Company",
+            value=job_obj.company or "",
+        )
+        edited_location = st.text_input(
+            "Location",
+            value=job_obj.location or "",
+        )
+        edited_url = st.text_input(
+            "Apply URL",
+            value=job_obj.apply_url or "",
+        )
+
+        confirm_button = st.form_submit_button("Confirm and Save to Database")
+
+        if confirm_button:
+            # (your existing final submission logic)
+            final_job_data = JobListing(
+                job_title=edited_title.strip() or None,
+                company=edited_company.strip() or None,
+                location=edited_location.strip() or None,
+                apply_url=edited_url.strip() or None,
+                description=job_obj.description,
+            )
+
+            description_hash = hash_description(final_job_data.description)
+
+            try:
+                if db_utils.check_for_duplicate(description_hash):
+                    st.warning(
+                        "This job listing appears to already exist in the database."
+                    )
+                else:
+                    db_utils.insert_job_listing(final_job_data, description_hash)
+                    st.success("Job listing saved successfully!")
+            except Exception as e:
+                st.error(f"An error occurred while saving to the database: {e}")
+
+            st.session_state.processed_job = None
+            st.session_state.job_text_input = ""
+            st.rerun()
+            
+## Recent Jobs Viewer at the Bottom of the App
+
+# At the bottom of app.py, after all the main UI logic, add this block to show a small dashboard of the most recent entries:
+
+st.markdown("---")
+st.subheader("Recent Job Listings in Database")
+
+col1, col2 = st.columns([1, 3])
+with col1:
+    limit = st.number_input(
+        "Rows to display",
+        min_value=1,
+        max_value=50,
+        value=10,
+        step=1,
+        help="How many of the most recent jobs to show.",
+    )
+
+# Simple way to re-fetch when user changes the limit or presses the button
+refresh = st.button("Refresh Recent Jobs")
+
+if refresh or True:
+    recent_jobs = db_utils.fetch_recent_job_listings(limit=int(limit))
+
+    if not recent_jobs:
+        st.info("No job listings found in the database yet.")
+    else:
+        # Streamlit will auto-convert list[dict] to a table/dataframe view
+        st.dataframe(recent_jobs, use_container_width=True)
+
+# If you don’t want it to auto-refresh on every rerun, you can remove or True and rely only on the button:
+
+if refresh:
+    recent_jobs = db_utils.fetch_recent_job_listings(limit=int(limit))
